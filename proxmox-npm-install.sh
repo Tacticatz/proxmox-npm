@@ -24,7 +24,7 @@ ask() {
   echo -ne "${BOLD}${CYAN}  ❯ ${NC}${prompt}"
   [[ -n "$default" ]] && echo -ne " ${YELLOW}[${default}]${NC}"
   echo -ne ": "
-  read -r input
+  read -r input </dev/tty
   echo "${input:-$default}"
 }
 
@@ -37,7 +37,7 @@ ask_list() {
     echo -e "    ${YELLOW}$((i+1))${NC}) ${items[$i]}"
   done
   echo -ne "${BOLD}${CYAN}  ❯ ${NC}Auswahl (Nummer oder Name): "
-  local input; read -r input
+  local input; read -r input </dev/tty
   # Wenn Zahl eingegeben → Element auswählen
   if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#items[@]} )); then
     echo "${items[$((input-1))]}"
@@ -125,7 +125,7 @@ echo -e "  ${BOLD}IP-Konfiguration:${NC}"
 echo -e "    ${YELLOW}1${NC}) DHCP (automatisch)"
 echo -e "    ${YELLOW}2${NC}) Statische IP"
 echo -ne "${BOLD}${CYAN}  ❯ ${NC}Auswahl [1]: "
-read -r ip_choice
+read -r ip_choice </dev/tty
 
 if [[ "${ip_choice:-1}" == "2" ]]; then
   CT_IP=$(ask "IP-Adresse (z.B. 192.168.1.100/24)" "")
@@ -160,7 +160,7 @@ echo -e "  IP             : ${BOLD}$CT_IP${NC}"
 echo -e "  DNS            : ${BOLD}$CT_DNS${NC}"
 echo ""
 echo -ne "${BOLD}${CYAN}  ❯ ${NC}Starten? ${YELLOW}[J/n]${NC}: "
-read -r confirm
+read -r confirm </dev/tty
 [[ "${confirm,,}" == "n" ]] && { echo "Abgebrochen."; exit 0; }
 echo ""
 
