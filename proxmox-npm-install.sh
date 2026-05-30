@@ -1,225 +1,283 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  Nginx Proxy Manager - Proxmox LXC Installer
-#  Führe dieses Script in der Proxmox Shell (als root) aus:
-#    bash -c "$(wget -qO- https://raw.githubusercontent.com/Tacticatz/proxmox-npm/main/proxmox-npm-install.sh)"
-#  ODER kopiere es nach Proxmox und führe es aus:
-#    bash proxmox-npm-install.sh
+#  bash -c "$(wget -qO- https://raw.githubusercontent.com/Tacticatz/proxmox-npm/main/proxmox-npm-install.sh)"
 # =============================================================================
 
 set -euo pipefail
 
 # ──────────────── Farben & Hilfsfunktionen ────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-msg()    { echo -e "${GREEN}✔ $1${NC}"; }
-info()   { echo -e "${BLUE}ℹ $1${NC}"; }
-warn()   { echo -e "${YELLOW}⚠ $1${NC}"; }
-error()  { echo -e "${RED}✘ $1${NC}"; exit 1; }
-header() { echo -e "\n${BOLD}${CYAN}$1${NC}\n"; }
+msg()    { echo -e "${GREEN}✔  $1${NC}"; }
+info()   { echo -e "${BLUE}ℹ  $1${NC}"; }
+warn()   { echo -e "${YELLOW}⚠  $1${NC}"; }
+error()  { echo -e "${RED}✘  $1${NC}"; exit 1; }
+header() { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}\n"; }
 
-# ──────────────── Konfiguration ────────────────
-CT_ID="${CT_ID:-$(pvesh get /cluster/nextid)}"
-CT_HOSTNAME="${CT_HOSTNAME:-nginx-proxy-manager}"
-CT_PASSWORD="${CT_PASSWORD:-npm@proxmox}"
-CT_CORES="${CT_CORES:-2}"
-CT_RAM="${CT_RAM:-1024}"
-CT_DISK="${CT_DISK:-8}"
-CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
-CT_IP="${CT_IP:-dhcp}"          # z.B. "192.168.1.100/24" für statische IP
-CT_GW="${CT_GW:-}"              # Gateway nur bei statischer IP nötig
-CT_DNS="${CT_DNS:-1.1.1.1}"
-TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
+ask() {
+  # ask "Frage" "Standardwert"  → gibt Eingabe zurück
+  local prompt="$1"
+  local default="$2"
+  local input
+  echo -ne "${BOLD}${CYAN}  ❯ ${NC}${prompt}"
+  [[ -n "$default" ]] && echo -ne " ${YELLOW}[${default}]${NC}"
+  echo -ne ": "
+  read -r input
+  echo "${input:-$default}"
+}
 
-# Storage automatisch erkennen: bevorzuge local-lvm, dann local, dann erstes verfügbares
-if [[ -z "${STORAGE:-}" ]]; then
-  if pvesm status 2>/dev/null | grep -q '^local-lvm'; then
-    STORAGE="local-lvm"
-  elif pvesm status 2>/dev/null | grep -qE '^local\s'; then
-    STORAGE="local"
+ask_list() {
+  # ask_list "Frage" item1 item2 item3 ...
+  local prompt="$1"; shift
+  local items=("$@")
+  echo -e "${BOLD}${CYAN}  ❯ ${NC}${prompt}:"
+  for i in "${!items[@]}"; do
+    echo -e "    ${YELLOW}$((i+1))${NC}) ${items[$i]}"
+  done
+  echo -ne "${BOLD}${CYAN}  ❯ ${NC}Auswahl (Nummer oder Name): "
+  local input; read -r input
+  # Wenn Zahl eingegeben → Element auswählen
+  if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#items[@]} )); then
+    echo "${items[$((input-1))]}"
   else
-    STORAGE=$(pvesm status 2>/dev/null | awk 'NR>1 && $2~/dir|lvmthin|lvm|zfspool/ {print $1; exit}')
-    [[ -z "$STORAGE" ]] && error "Kein geeigneter Storage gefunden! Bitte STORAGE=<name> manuell setzen."
+    echo "$input"
   fi
+}
+
+# ──────────────── Root-Check & Proxmox-Check ────────────────
+[[ "$(id -u)" != "0" ]] && error "Muss als root ausgeführt werden!"
+command -v pveversion &>/dev/null || error "Kein Proxmox-System erkannt!"
+
+# ──────────────── Banner ────────────────
+clear
+echo ""
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${CYAN}║     Nginx Proxy Manager – Proxmox LXC Installer   ║${NC}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+echo ""
+
+# ──────────────── Auto-Erkennung ────────────────
+header "Systemerkennung"
+
+# Nächste freie Container-ID
+NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
+info "Nächste freie Container-ID: $NEXT_ID"
+
+# Verfügbare Storages ermitteln (die rootdir/images unterstützen)
+STORAGES=()
+while IFS= read -r line; do
+  name=$(echo "$line" | awk '{print $1}')
+  [[ -n "$name" && "$name" != "Name" ]] && STORAGES+=("$name")
+done < <(pvesm status --content rootdir 2>/dev/null | tail -n +2 || \
+         pvesm status 2>/dev/null | awk 'NR>1 {print $1}')
+
+if [[ ${#STORAGES[@]} -eq 0 ]]; then
+  # Fallback: alle Storages anzeigen
+  while IFS= read -r s; do STORAGES+=("$s"); done \
+    < <(pvesm status 2>/dev/null | awk 'NR>1 {print $1}')
 fi
 
-# NPM Ports
-PORT_HTTP=80
-PORT_ADMIN=81
-PORT_HTTPS=443
-PORT_IMAP=143
-PORT_SMTPS=465
-PORT_SMTP=587
-PORT_IMAPS=993
+# Verfügbare Netzwerk-Bridges ermitteln
+BRIDGES=()
+while IFS= read -r br; do
+  [[ "$br" =~ ^vmbr ]] && BRIDGES+=("$br")
+done < <(ip link show 2>/dev/null | grep -oP 'vmbr\d+' | sort -u || echo "vmbr0")
+[[ ${#BRIDGES[@]} -eq 0 ]] && BRIDGES=("vmbr0")
 
-# ──────────────── Prüfungen ────────────────
-header "═══════════════════════════════════════════"
-header "   Nginx Proxy Manager – Proxmox Installer "
-header "═══════════════════════════════════════════"
+info "Gefundene Storages : ${STORAGES[*]}"
+info "Gefundene Bridges  : ${BRIDGES[*]}"
 
-[[ "$(id -u)" != "0" ]] && error "Dieses Script muss als root ausgeführt werden!"
-command -v pveversion &>/dev/null || error "Kein Proxmox-System erkannt. Dieses Script läuft nur auf Proxmox VE."
+# ──────────────── Interaktive Konfiguration ────────────────
+header "Container-Konfiguration"
+echo -e "  ${YELLOW}Einfach Enter drücken um den Standardwert [in Klammern] zu übernehmen.${NC}\n"
 
-info "Container ID  : $CT_ID"
-info "Hostname      : $CT_HOSTNAME"
-info "CPU-Kerne     : $CT_CORES"
-info "RAM           : ${CT_RAM} MB"
-info "Festplatte    : ${CT_DISK} GB"
-info "Bridge        : $CT_BRIDGE"
-info "IP            : $CT_IP"
-info "Storage       : $STORAGE"
+CT_ID=$(ask "Container-ID" "$NEXT_ID")
+CT_HOSTNAME=$(ask "Hostname" "nginx-proxy-manager")
+CT_PASSWORD=$(ask "Root-Passwort des Containers" "npm@proxmox")
+CT_CORES=$(ask "CPU-Kerne" "2")
+CT_RAM=$(ask "RAM in MB" "1024")
+CT_DISK=$(ask "Festplattengröße in GB" "8")
 
-# ──────────────── Debian-Template herunterladen ────────────────
-header "1/5 Template herunterladen..."
+echo ""
 
-TEMPLATE_LIST=$(pveam available --section system 2>/dev/null | grep -i "debian-12" | head -1)
-if [[ -z "$TEMPLATE_LIST" ]]; then
-  error "Kein Debian 12 Template verfügbar. Bitte prüfe deine Proxmox-Verbindung."
+# Storage auswählen
+if [[ ${#STORAGES[@]} -eq 1 ]]; then
+  STORAGE="${STORAGES[0]}"
+  info "Storage: $STORAGE (einziger verfügbarer)"
+else
+  STORAGE=$(ask_list "Storage für den Container" "${STORAGES[@]}")
 fi
 
-TEMPLATE_NAME=$(echo "$TEMPLATE_LIST" | awk '{print $2}')
-info "Verwende Template: $TEMPLATE_NAME"
+# Bridge auswählen
+if [[ ${#BRIDGES[@]} -eq 1 ]]; then
+  CT_BRIDGE="${BRIDGES[0]}"
+  info "Bridge: $CT_BRIDGE (einzige verfügbare)"
+else
+  CT_BRIDGE=$(ask_list "Netzwerk-Bridge" "${BRIDGES[@]}")
+fi
+
+echo ""
+
+# IP-Konfiguration
+echo -e "  ${BOLD}IP-Konfiguration:${NC}"
+echo -e "    ${YELLOW}1${NC}) DHCP (automatisch)"
+echo -e "    ${YELLOW}2${NC}) Statische IP"
+echo -ne "${BOLD}${CYAN}  ❯ ${NC}Auswahl [1]: "
+read -r ip_choice
+
+if [[ "${ip_choice:-1}" == "2" ]]; then
+  CT_IP=$(ask "IP-Adresse (z.B. 192.168.1.100/24)" "")
+  CT_GW=$(ask "Gateway (z.B. 192.168.1.1)" "")
+  NET_CONFIG="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IP},gw=${CT_GW},ip6=auto"
+else
+  CT_IP="dhcp"
+  CT_GW=""
+  NET_CONFIG="name=eth0,bridge=${CT_BRIDGE},ip=dhcp,ip6=auto"
+fi
+
+CT_DNS=$(ask "DNS-Server" "1.1.1.1")
+
+# Template Storage (immer "local" in Proxmox Standard)
+TEMPLATE_STORAGE="local"
+if ! pvesm list local &>/dev/null; then
+  TEMPLATE_STORAGE="${STORAGES[0]}"
+fi
+
+# ──────────────── Zusammenfassung ────────────────
+echo ""
+echo -e "${BOLD}${CYAN}━━━ Zusammenfassung ━━━${NC}"
+echo ""
+echo -e "  Container ID   : ${BOLD}$CT_ID${NC}"
+echo -e "  Hostname       : ${BOLD}$CT_HOSTNAME${NC}"
+echo -e "  CPU-Kerne      : ${BOLD}$CT_CORES${NC}"
+echo -e "  RAM            : ${BOLD}${CT_RAM} MB${NC}"
+echo -e "  Festplatte     : ${BOLD}${CT_DISK} GB${NC}"
+echo -e "  Storage        : ${BOLD}$STORAGE${NC}"
+echo -e "  Bridge         : ${BOLD}$CT_BRIDGE${NC}"
+echo -e "  IP             : ${BOLD}$CT_IP${NC}"
+echo -e "  DNS            : ${BOLD}$CT_DNS${NC}"
+echo ""
+echo -ne "${BOLD}${CYAN}  ❯ ${NC}Starten? ${YELLOW}[J/n]${NC}: "
+read -r confirm
+[[ "${confirm,,}" == "n" ]] && { echo "Abgebrochen."; exit 0; }
+echo ""
+
+# ──────────────── 1/5 Template herunterladen ────────────────
+header "1/5  Debian-Template herunterladen"
+
+TEMPLATE_NAME=$(pveam available --section system 2>/dev/null | grep -i "debian-12" | awk '{print $2}' | head -1)
+[[ -z "$TEMPLATE_NAME" ]] && error "Kein Debian 12 Template gefunden. Internet-Verbindung prüfen."
+info "Template: $TEMPLATE_NAME"
 
 if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_NAME"; then
-  info "Template wird heruntergeladen..."
-  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME" || error "Template-Download fehlgeschlagen!"
-  msg "Template heruntergeladen."
-else
-  msg "Template bereits vorhanden."
+  info "Herunterladen..."
+  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME" || error "Download fehlgeschlagen!"
 fi
+msg "Template bereit."
 
 TEMPLATE_PATH="$TEMPLATE_STORAGE:vztmpl/$TEMPLATE_NAME"
 
-# ──────────────── LXC-Container erstellen ────────────────
-header "2/5 LXC-Container erstellen..."
-
-# IP-Konfiguration aufbauen
-if [[ "$CT_IP" == "dhcp" ]]; then
-  NET_CONFIG="name=eth0,bridge=${CT_BRIDGE},ip=dhcp,ip6=auto"
-else
-  [[ -z "$CT_GW" ]] && error "Bei statischer IP muss CT_GW (Gateway) gesetzt sein!"
-  NET_CONFIG="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IP},gw=${CT_GW},ip6=auto"
-fi
+# ──────────────── 2/5 Container erstellen ────────────────
+header "2/5  LXC-Container erstellen"
 
 pct create "$CT_ID" "$TEMPLATE_PATH" \
-  --hostname "$CT_HOSTNAME" \
-  --password "$CT_PASSWORD" \
-  --cores "$CT_CORES" \
-  --memory "$CT_RAM" \
-  --rootfs "$STORAGE:${CT_DISK}" \
-  --net0 "$NET_CONFIG" \
-  --nameserver "$CT_DNS" \
-  --features "nesting=1" \
+  --hostname    "$CT_HOSTNAME" \
+  --password    "$CT_PASSWORD" \
+  --cores       "$CT_CORES" \
+  --memory      "$CT_RAM" \
+  --rootfs      "${STORAGE}:${CT_DISK}" \
+  --net0        "$NET_CONFIG" \
+  --nameserver  "$CT_DNS" \
+  --features    "nesting=1" \
   --unprivileged 1 \
-  --onboot 1 \
-  --start 0 \
-  --description "Nginx Proxy Manager – installiert via proxmox-npm-install.sh" \
+  --onboot      1 \
+  --start       0 \
+  --description "Nginx Proxy Manager – https://github.com/Tacticatz/proxmox-npm" \
   || error "Container konnte nicht erstellt werden!"
 
 msg "Container $CT_ID erstellt."
 
-# ──────────────── Container starten ────────────────
-header "3/5 Container starten..."
+# ──────────────── 3/5 Container starten ────────────────
+header "3/5  Container starten"
 pct start "$CT_ID"
-sleep 5
+sleep 6
 msg "Container gestartet."
 
-# ──────────────── NPM installieren ────────────────
-header "4/5 Nginx Proxy Manager installieren..."
-info "Dies kann 2–5 Minuten dauern..."
+# ──────────────── 4/5 NPM installieren ────────────────
+header "4/5  Nginx Proxy Manager installieren"
+info "Dies dauert ca. 3–6 Minuten..."
 
 pct exec "$CT_ID" -- bash -c '
 set -euo pipefail
-
 export DEBIAN_FRONTEND=noninteractive
 
-echo "→ System aktualisieren..."
-apt-get update -qq
-apt-get upgrade -y -qq
+echo "  → System aktualisieren..."
+apt-get update -qq && apt-get upgrade -y -qq
 
-echo "→ Abhängigkeiten installieren..."
+echo "  → Abhängigkeiten installieren..."
 apt-get install -y -qq \
   curl wget gnupg2 ca-certificates lsb-release \
-  build-essential git python3 python3-pip \
+  build-essential git python3 \
   openssl libssl-dev libffi-dev \
-  nginx certbot
+  libcap2-bin sqlite3 logrotate
 
-echo "→ Node.js 18 installieren..."
+echo "  → Node.js 18 installieren..."
 curl -fsSL https://deb.nodesource.com/setup_18.x | bash - >/dev/null 2>&1
 apt-get install -y -qq nodejs
 
-echo "→ Node-Version: $(node --version)"
+echo "  → OpenResty installieren..."
+apt-get install -y -qq zlib1g-dev libpcre3 libpcre3-dev
+echo "deb http://openresty.org/package/debian $(lsb_release -sc) openresty" \
+  > /etc/apt/sources.list.d/openresty.list
+curl -fsSL https://openresty.org/package/pubkey.gpg | gpg --dearmor \
+  -o /etc/apt/trusted.gpg.d/openresty.gpg 2>/dev/null
+apt-get update -qq
+apt-get install -y -qq openresty || apt-get install -y -qq nginx
 
-echo "→ SQLite3 & openresty vorbereiten..."
-apt-get install -y -qq \
-  libcap2-bin sqlite3 logrotate
-
-echo "→ Nginx Proxy Manager herunterladen..."
-NPM_VERSION=$(curl -s "https://api.github.com/repos/NginxProxyManager/nginx-proxy-manager/releases/latest" | grep tag_name | cut -d '"' -f 4)
-echo "  Version: $NPM_VERSION"
+echo "  → Nginx Proxy Manager herunterladen..."
+NPM_VERSION=$(curl -s "https://api.github.com/repos/NginxProxyManager/nginx-proxy-manager/releases/latest" \
+  | grep tag_name | cut -d'"' -f4)
+echo "    Version: $NPM_VERSION"
 
 mkdir -p /opt/nginx-proxy-manager
-cd /opt/nginx-proxy-manager
-
 curl -sL "https://github.com/NginxProxyManager/nginx-proxy-manager/archive/refs/tags/${NPM_VERSION}.tar.gz" \
-  -o npm.tar.gz
-tar -xzf npm.tar.gz --strip-components=1
-rm npm.tar.gz
+  | tar -xz -C /opt/nginx-proxy-manager --strip-components=1
 
-echo "→ OpenResty installieren..."
-apt-get install -y -qq \
-  zlib1g-dev libpcre3 libpcre3-dev
-
-if ! command -v openresty &>/dev/null; then
-  echo "deb http://openresty.org/package/debian $(lsb_release -sc) openresty" \
-    > /etc/apt/sources.list.d/openresty.list
-  curl -fsSL https://openresty.org/package/pubkey.gpg | apt-key add - >/dev/null 2>&1
-  apt-get update -qq
-  apt-get install -y -qq openresty || apt-get install -y -qq nginx
-fi
-
-echo "→ Backend installieren..."
+echo "  → Backend installieren..."
 cd /opt/nginx-proxy-manager/backend
 npm ci --production --silent 2>/dev/null || npm install --production --silent
 
-echo "→ Frontend bauen..."
+echo "  → Frontend bauen..."
 cd /opt/nginx-proxy-manager/frontend
 npm ci --silent 2>/dev/null || npm install --silent
 npm run build --silent 2>/dev/null || true
 
-echo "→ Verzeichnisse erstellen..."
-mkdir -p /data/nginx /data/custom_ssl /data/logs /data/access /data/nginx/default_host \
-         /data/nginx/default_www /data/nginx/proxy_host /data/nginx/redirection_host \
-         /data/nginx/stream /data/nginx/dead_host /data/nginx/temp \
-         /data/letsencrypt-acme-challenge /etc/letsencrypt /var/log/nginx-proxy-manager
+echo "  → Verzeichnisse anlegen..."
+mkdir -p /data/nginx /data/custom_ssl /data/logs /data/access \
+  /data/nginx/{default_host,default_www,proxy_host,redirection_host,stream,dead_host,temp} \
+  /data/letsencrypt-acme-challenge /etc/letsencrypt /var/log/nginx-proxy-manager
 
-echo "→ Konfiguration erstellen..."
-cat > /opt/nginx-proxy-manager/config/production.json <<EOF2
+echo "  → Datenbank-Konfiguration schreiben..."
+mkdir -p /opt/nginx-proxy-manager/config
+cat > /opt/nginx-proxy-manager/config/production.json <<EOF
 {
   "database": {
     "engine": "knex-native",
     "knex": {
       "client": "sqlite3",
-      "connection": {
-        "filename": "/data/database.sqlite"
-      }
+      "connection": { "filename": "/data/database.sqlite" }
     }
   }
 }
-EOF2
+EOF
 
-echo "→ Systemd-Service einrichten..."
-cat > /etc/systemd/system/npm.service <<EOF2
+echo "  → Systemd-Service einrichten..."
+cat > /etc/systemd/system/npm.service <<EOF
 [Unit]
 Description=Nginx Proxy Manager
 After=network.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -234,50 +292,39 @@ SyslogIdentifier=npm
 
 [Install]
 WantedBy=multi-user.target
-EOF2
+EOF
 
 systemctl daemon-reload
 systemctl enable npm
 systemctl start npm || true
-
-echo "✔ Installation abgeschlossen!"
+echo "  ✔ Installation abgeschlossen!"
 '
 
-# ──────────────── Abschluss ────────────────
-header "5/5 Fertig! 🎉"
+# ──────────────── 5/5 Fertig ────────────────
+header "5/5  Fertig!"
 
-# IP-Adresse ermitteln
-sleep 3
+sleep 4
 CONTAINER_IP=$(pct exec "$CT_ID" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "Unbekannt")
 
 echo ""
-echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${GREEN}║   Nginx Proxy Manager erfolgreich installiert  ║${NC}"
-echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${GREEN}║      Nginx Proxy Manager erfolgreich installiert!  ║${NC}"
+echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${BOLD}Container ID :${NC} $CT_ID"
 echo -e "  ${BOLD}IP-Adresse   :${NC} $CONTAINER_IP"
 echo ""
-echo -e "  ${BOLD}${CYAN}Admin-Oberfläche:${NC}"
-echo -e "  🌐 http://${CONTAINER_IP}:81"
+echo -e "  ${BOLD}${CYAN}Admin-Oberfläche:${NC}  http://${CONTAINER_IP}:81"
 echo ""
-echo -e "  ${BOLD}Standard-Zugangsdaten:${NC}"
-echo -e "  📧 E-Mail    : admin@example.com"
-echo -e "  🔑 Passwort  : changeme"
+echo -e "  ${BOLD}Standard-Login:${NC}"
+echo -e "  📧  admin@example.com"
+echo -e "  🔑  changeme"
 echo ""
-echo -e "  ${YELLOW}⚠ Bitte das Passwort beim ersten Login sofort ändern!${NC}"
+echo -e "  ${YELLOW}⚠  Beim ersten Login sofort Passwort ändern!${NC}"
 echo ""
-echo -e "  ${BOLD}Freigegebene Ports:${NC}"
-echo -e "  80  → HTTP"
-echo -e "  81  → Admin-UI"
-echo -e "  443 → HTTPS"
-echo -e "  143 → IMAP"
-echo -e "  465 → SMTPS"
-echo -e "  587 → SMTP"
-echo -e "  993 → IMAPS"
+echo -e "  ${BOLD}Ports:${NC}  80 (HTTP)  81 (Admin)  443 (HTTPS)"
+echo -e "          143 (IMAP)  465 (SMTPS)  587 (SMTP)  993 (IMAPS)"
 echo ""
 echo -e "  ${BOLD}Container verwalten:${NC}"
-echo -e "  pct stop  $CT_ID   # Stoppen"
-echo -e "  pct start $CT_ID   # Starten"
-echo -e "  pct enter $CT_ID   # Shell öffnen"
+echo -e "  pct start $CT_ID  /  pct stop $CT_ID  /  pct enter $CT_ID"
 echo ""
