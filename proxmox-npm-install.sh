@@ -2,7 +2,7 @@
 # =============================================================================
 #  Nginx Proxy Manager - Proxmox LXC Installer
 #  Führe dieses Script in der Proxmox Shell (als root) aus:
-#    bash -c "$(wget -qO- https://raw.githubusercontent.com/.../proxmox-npm-install.sh)"
+#    bash -c "$(wget -qO- https://raw.githubusercontent.com/Tacticatz/proxmox-npm/main/proxmox-npm-install.sh)"
 #  ODER kopiere es nach Proxmox und führe es aus:
 #    bash proxmox-npm-install.sh
 # =============================================================================
@@ -35,8 +35,19 @@ CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
 CT_IP="${CT_IP:-dhcp}"          # z.B. "192.168.1.100/24" für statische IP
 CT_GW="${CT_GW:-}"              # Gateway nur bei statischer IP nötig
 CT_DNS="${CT_DNS:-1.1.1.1}"
-STORAGE="${STORAGE:-local-lvm}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
+
+# Storage automatisch erkennen: bevorzuge local-lvm, dann local, dann erstes verfügbares
+if [[ -z "${STORAGE:-}" ]]; then
+  if pvesm status 2>/dev/null | grep -q '^local-lvm'; then
+    STORAGE="local-lvm"
+  elif pvesm status 2>/dev/null | grep -qE '^local\s'; then
+    STORAGE="local"
+  else
+    STORAGE=$(pvesm status 2>/dev/null | awk 'NR>1 && $2~/dir|lvmthin|lvm|zfspool/ {print $1; exit}')
+    [[ -z "$STORAGE" ]] && error "Kein geeigneter Storage gefunden! Bitte STORAGE=<name> manuell setzen."
+  fi
+fi
 
 # NPM Ports
 PORT_HTTP=80
