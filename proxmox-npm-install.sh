@@ -4,6 +4,20 @@
 #  bash -c "$(wget -qO- https://raw.githubusercontent.com/Tacticatz/proxmox-npm/main/proxmox-npm-install.sh)"
 # =============================================================================
 
+# ── Pipe-Erkennung: Script lädt sich selbst in Datei & startet neu ──────────
+# Wenn stdin kein Terminal ist (z.B. wget | bash), funktionieren read-Befehle
+# nicht korrekt. Lösung: Script in Tempfile speichern und neu ausführen.
+if [ ! -t 0 ]; then
+  SELF_URL="https://raw.githubusercontent.com/Tacticatz/proxmox-npm/main/proxmox-npm-install.sh"
+  TMP_SCRIPT=$(mktemp /tmp/npm-install-XXXX.sh)
+  echo "Script wird heruntergeladen..." >&2
+  wget -qO "$TMP_SCRIPT" "${SELF_URL}?ts=$(date +%s)" || \
+    curl -fsSLo "$TMP_SCRIPT" "$SELF_URL"
+  chmod +x "$TMP_SCRIPT"
+  exec bash "$TMP_SCRIPT"
+  exit 0
+fi
+
 set -euo pipefail
 
 # ──────────────── Farben & Hilfsfunktionen ────────────────
