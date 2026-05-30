@@ -21,9 +21,9 @@ ask() {
   local prompt="$1"
   local default="$2"
   local input
-  echo -ne "${BOLD}${CYAN}  ❯ ${NC}${prompt}"
-  [[ -n "$default" ]] && echo -ne " ${YELLOW}[${default}]${NC}"
-  echo -ne ": "
+  echo -ne "${BOLD}${CYAN}  ❯ ${NC}${prompt}" >&2
+  [[ -n "$default" ]] && echo -ne " ${YELLOW}[${default}]${NC}" >&2
+  echo -ne ": " >&2
   read -r input </dev/tty
   echo "${input:-$default}"
 }
@@ -32,11 +32,11 @@ ask_list() {
   # ask_list "Frage" item1 item2 item3 ...
   local prompt="$1"; shift
   local items=("$@")
-  echo -e "${BOLD}${CYAN}  ❯ ${NC}${prompt}:"
+  echo -e "${BOLD}${CYAN}  ❯ ${NC}${prompt}:" >&2
   for i in "${!items[@]}"; do
-    echo -e "    ${YELLOW}$((i+1))${NC}) ${items[$i]}"
+    echo -e "    ${YELLOW}$((i+1))${NC}) ${items[$i]}" >&2
   done
-  echo -ne "${BOLD}${CYAN}  ❯ ${NC}Auswahl (Nummer oder Name): "
+  echo -ne "${BOLD}${CYAN}  ❯ ${NC}Auswahl (Nummer oder Name): " >&2
   local input; read -r input </dev/tty
   # Wenn Zahl eingegeben → Element auswählen
   if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= ${#items[@]} )); then
